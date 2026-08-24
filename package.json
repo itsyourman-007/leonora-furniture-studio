@@ -5,8 +5,8 @@
   "description": "Leonora Furniture Studio e-commerce store with Razorpay checkout.",
   "main": "server/index.js",
   "scripts": {
-    "start": "node server/start.js",
-    "dev": "node --watch server/start.js"
+    "start": "node -r ./server/cloudinary-bootstrap.js server/start.js",
+    "dev": "node --watch -r ./server/cloudinary-bootstrap.js server/start.js"
   },
   "engines": {"node": ">=18"},
   "dependencies": {
