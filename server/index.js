@@ -24,8 +24,13 @@ const readJson = file => JSON.parse(fs.readFileSync(file, 'utf8'));
 const writeJson = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
 const now = () => new Date().toISOString();
 const adminSessions = new Map();
+const rateBuckets = new Map();
+const finalizingOrders = new Set();
 
-const razorpayReady = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+const razorpayReady = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET && process.env.RAZORPAY_WEBHOOK_SECRET);
+const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim();
+const paymentReservationMs = 15 * 60 * 1000;
+const storeCurrency = 'INR';
 const razorpay = razorpayReady ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET }) : null;
 const mailReady = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 const transporter = mailReady ? nodemailer.createTransport({
@@ -46,6 +51,19 @@ function updateOrder(id, patch) {
   writeJson(ORDERS_FILE, orders);
   return orders[i];
 }
+function normalizeEmail(value) { return String(value || '').trim().toLowerCase(); }
+function cleanText(value, max = 180) { return String(value || '').trim().replace(/\s+/g, ' ').slice(0, max); }
+function validEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
+function validPhone(value) { return /^[+0-9()\-\s]{7,20}$/.test(value); }
+function validPincode(value) { return /^[A-Za-z0-9\s-]{3,12}$/.test(value); }
+function orderFingerprint(email, items, total) { return JSON.stringify({ email, items: items.map(i => ({ id:i.id, quantity:i.quantity, selectedColor:i.selectedColor || null, selectedFabric:i.selectedFabric || null })), total }); }
+function isActiveReservation(order) {
+  return order?.paymentStatus === 'pending' && order?.status === 'payment_pending' && new Date(order.reservationExpiresAt || new Date(new Date(order.createdAt).getTime() + paymentReservationMs)).getTime() > Date.now();
+}
+function reservedQuantity(orders, productId) { return orders.filter(isActiveReservation).reduce((sum, order) => sum + order.items.filter(item => item.id === productId).reduce((n, item) => n + Number(item.quantity || 0), 0), 0); }
+function publicOrder(order) {
+  return { id:order.id, status:order.status, paymentStatus:order.paymentStatus, total:order.total, currency:order.currency, createdAt:order.createdAt, paidAt:order.paidAt || null, items:(order.items || []).map(item => ({ name:item.name, quantity:item.quantity })) };
+}
 function adminAuth(req, res, next) {
   const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!token || !adminSessions.has(token)) return res.status(401).json({ error: 'Admin authentication required.' });
@@ -60,8 +78,19 @@ function verifyRazorpaySignature(orderId, paymentId, signature) {
   const a = Buffer.from(expected); const b = Buffer.from(String(signature || ''));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+function rateLimit(limit, windowMs) {
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.path}`;
+    const nowMs = Date.now();
+    const bucket = rateBuckets.get(key) || { startedAt:nowMs, count:0 };
+    if (nowMs - bucket.startedAt >= windowMs) { bucket.startedAt = nowMs; bucket.count = 0; }
+    bucket.count += 1; rateBuckets.set(key, bucket);
+    if (bucket.count > limit) return res.status(429).json({ error:'Too many requests. Please try again shortly.' });
+    next();
+  };
+}
 function verifyWebhook(raw, signature) {
-  if (!process.env.RAZORPAY_WEBHOOK_SECRET) return false;
+  if (!process.env.RAZORPAY_WEBHOOK_SECRET || !raw) return false;
   const expected = crypto.createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex');
   const a = Buffer.from(expected); const b = Buffer.from(String(signature || ''));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -87,83 +116,125 @@ async function sendCustomizationEmail(request) {
   return sendMail({ to: request.email, subject: `Leonora customisation request ${request.id}`, html });
 }
 async function markPaid(order, paymentId) {
-  if (!order) return null;
-  if (order.paymentStatus === 'paid') return order;
-  let updated = updateOrder(order.id, { paymentStatus: 'paid', status: 'confirmed', razorpayPaymentId: paymentId || order.razorpayPaymentId, paidAt: order.paidAt || now() });
-  if (updated && !updated.inventoryDeductedAt) {
-    const products = readJson(PRODUCTS_FILE);
-    for (const item of updated.items) {
-      const product = products.find(x => x.id === item.id);
-      if (product) product.stock = Math.max(0, Number(product.stock || 0) - Number(item.quantity || 0));
+  if (!order || !paymentId || !order.razorpayOrderId) return null;
+  const current = findOrder(order.id);
+  if (current?.paymentStatus === 'paid') return current;
+  if (finalizingOrders.has(order.id)) return current || order;
+  finalizingOrders.add(order.id);
+  try {
+    let updated = findOrder(order.id);
+    if (!updated || updated.paymentStatus === 'paid') return updated;
+    updated = updateOrder(updated.id, { paymentStatus:'paid', status:'confirmed', razorpayPaymentId:paymentId, paidAt:updated.paidAt || now() });
+    if (updated && !updated.inventoryDeductedAt) {
+      const products = readJson(PRODUCTS_FILE);
+      for (const item of updated.items) {
+        const product = products.find(x => x.id === item.id);
+        if (product) product.stock = Math.max(0, Number(product.stock || 0) - Number(item.quantity || 0));
+      }
+      writeJson(PRODUCTS_FILE, products);
+      updated = updateOrder(updated.id, { inventoryDeductedAt:now() });
     }
-    writeJson(PRODUCTS_FILE, products);
-    updated = updateOrder(updated.id, { inventoryDeductedAt: now() });
-  }
-  if (updated) await sendConfirmationEmail(updated).catch(e => console.error('Email error', e));
-  return updated;
+    if (updated) await sendConfirmationEmail(updated).catch(e => console.error('Email error', e));
+    return updated;
+  } finally { finalizingOrders.delete(order.id); }
 }
 
-app.use(cors());
-app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use((req, res, next) => { res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin'); res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+app.use(publicOrigin ? cors({ origin: publicOrigin }) : cors({ origin: false }));
+app.post('/api/webhooks/razorpay', rateLimit(120, 60 * 1000), express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!verifyWebhook(req.body, req.headers['x-razorpay-signature'])) return res.status(400).send('Invalid webhook signature');
-    const eventId = req.headers['x-razorpay-event-id'];
+    const payload = JSON.parse(req.body.toString('utf8'));
+    const eventId = cleanText(req.headers['x-razorpay-event-id'], 120);
     const seen = readJson(EVENTS_FILE);
     if (eventId && seen.includes(eventId)) return res.status(200).send('ok');
-    if (eventId) { seen.push(eventId); writeJson(EVENTS_FILE, seen.slice(-1000)); }
-    const payload = JSON.parse(req.body.toString('utf8'));
     const payment = payload?.payload?.payment?.entity;
     const orderEntity = payload?.payload?.order?.entity;
     const rpOrderId = payment?.order_id || orderEntity?.id;
     const order = rpOrderId ? findOrder(rpOrderId) : null;
-    if (order && ['payment.captured', 'order.paid'].includes(payload.event)) await markPaid(order, payment?.id);
-    if (order && payload.event === 'payment.failed') updateOrder(order.id, { paymentStatus: 'failed', status: 'payment_failed', failureReason: payment?.error_description || 'Payment failed' });
+    if (order && ['payment.captured', 'order.paid'].includes(payload.event)) {
+      const validCapture = payment && payment.id && payment.order_id === order.razorpayOrderId && payment.status === 'captured' && Number(payment.amount) === Number(order.amount || Number(order.total) * 100);
+      if (!validCapture) return res.status(400).send('Payment/order validation failed');
+      await markPaid(order, payment.id);
+    } else if (order && order.paymentStatus !== 'paid' && payload.event === 'payment.failed' && payment?.order_id === order.razorpayOrderId) {
+      updateOrder(order.id, { paymentStatus:'failed', status:'payment_failed', razorpayPaymentId:payment.id || null, failureReason:cleanText(payment.error_description || payment.error_code || 'Payment failed', 240) });
+    }
+    if (eventId) { seen.push(eventId); writeJson(EVENTS_FILE, seen.slice(-1000)); }
     res.status(200).send('ok');
-  } catch (e) { console.error(e); res.status(500).send('Webhook processing failed'); }
+  } catch (e) { console.error('Webhook processing error', e); res.status(500).send('Webhook processing failed'); }
 });
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(ROOT, 'public')));
 
-app.get('/api/config', (req,res) => res.json({ razorpayKeyId: process.env.RAZORPAY_KEY_ID || null, currency: process.env.STORE_CURRENCY || 'INR', ready: razorpayReady }));
+app.get('/api/config', (req,res) => res.json({ razorpayKeyId: razorpayReady ? process.env.RAZORPAY_KEY_ID : null, currency:storeCurrency, ready:razorpayReady }));
 app.get('/api/products', (req,res) => res.json(readJson(PRODUCTS_FILE)));
-app.get('/api/orders/:id', (req,res) => { const o = findOrder(req.params.id); if (!o) return res.status(404).json({ error:'Order not found' }); res.json(o); });
-
-app.post('/api/orders/create', async (req,res) => {
-  try {
-    if (!razorpayReady) return res.status(503).json({ error: 'Razorpay is not configured. Add keys in .env.' });
-    const { items, email, shipping } = req.body || {};
-    if (!Array.isArray(items) || !items.length || !email || !shipping?.name || !shipping?.phone || !shipping?.address1 || !shipping?.city || !shipping?.state || !shipping?.pincode) return res.status(400).json({ error:'Complete customer, delivery and cart details are required.' });
-    const products = readJson(PRODUCTS_FILE);
-    const cleanItems = items.map(item => {
-      const p = products.find(x => x.id === item.id); if (!p) throw new Error(`Product not found: ${item.id}`);
-      const quantity = Math.max(1, Math.min(10, Number(item.quantity || 1)));
-      if (Number(p.stock || 0) < quantity) throw new Error(`${p.name} is not available in the requested quantity.`);
-      return { id:p.id, name:p.name, price:Number(p.price), quantity, image:p.image, selectedColor:item.selectedColor || null, selectedFabric:item.selectedFabric || null };
-    });
-    const subtotal = cleanItems.reduce((s,i)=>s+i.price*i.quantity,0);
-    const shippingFee = subtotal >= 100000 ? 0 : 2500;
-    const total = subtotal + shippingFee;
-    const receipt = `LEO-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
-    const rp = await razorpay.orders.create({ amount: total*100, currency:'INR', receipt, payment_capture:1, notes:{ store_order_id:receipt, customer_email:email } });
-    const order = { id:receipt, razorpayOrderId:rp.id, email, shipping, items:cleanItems, subtotal, shippingFee, total, currency:'INR', status:'payment_pending', paymentStatus:'pending', createdAt:now() };
-    const orders = readJson(ORDERS_FILE); orders.push(order); writeJson(ORDERS_FILE,orders);
-    res.json({ orderId:receipt, razorpayOrderId:rp.id, amount:total*100, currency:'INR', keyId:process.env.RAZORPAY_KEY_ID });
-  } catch(e) { console.error(e); res.status(500).json({ error:e.message || 'Unable to create order.' }); }
+app.get('/api/orders/status', (req,res) => res.status(405).json({ error:'Use POST with order reference and checkout email.' }));
+app.get('/api/orders/:id', (req,res) => res.status(405).json({ error:'Order lookup requires POST with order reference and checkout email.' }));
+app.post('/api/orders/status', rateLimit(20, 10 * 60 * 1000), (req,res) => {
+  const id = cleanText(req.body?.orderId, 80);
+  const email = normalizeEmail(req.body?.email);
+  const order = findOrder(id);
+  if (!order || !validEmail(email) || normalizeEmail(order.email) !== email) return res.status(404).json({ error:'Order not found.' });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(publicOrder(order));
 });
 
-app.post('/api/orders/verify', async (req,res) => {
+app.post('/api/orders/create', rateLimit(10, 10 * 60 * 1000), async (req,res) => {
   try {
-    if (!razorpayReady) return res.status(503).json({ error:'Razorpay is not configured.' });
+    if (!razorpayReady) return res.status(503).json({ error:'Payment service is not configured.' });
+    const { items, shipping } = req.body || {};
+    const email = normalizeEmail(req.body?.email);
+    const idempotencyKey = cleanText(req.headers['x-idempotency-key'] || req.body?.idempotencyKey, 100);
+    if (!idempotencyKey || !/^[A-Za-z0-9._:-]{16,100}$/.test(idempotencyKey)) return res.status(400).json({ error:'A valid payment request key is required. Please retry checkout.' });
+    if (!Array.isArray(items) || !items.length || items.length > 50 || !validEmail(email)) return res.status(400).json({ error:'A valid email and at least one cart item are required.' });
+    if (!shipping || !cleanText(shipping.name, 120) || !validPhone(shipping.phone) || !validPincode(shipping.pincode) || !cleanText(shipping.city, 80) || !cleanText(shipping.state, 80) || !cleanText(shipping.address1, 240)) return res.status(400).json({ error:'Complete customer and delivery details are required.' });
+    const products = readJson(PRODUCTS_FILE); const orders = readJson(ORDERS_FILE);
+    const cleanItems = items.map(item => {
+      const p = products.find(x => x.id === item.id); if (!p) throw new Error('One of the selected products is no longer available.');
+      const requested = Number(item.quantity); if (!Number.isInteger(requested) || requested < 1 || requested > 10) throw new Error(`Invalid quantity for ${p.name}.`);
+      const reserved = reservedQuantity(orders, p.id); if (Number(p.stock || 0) - reserved < requested) throw new Error(`${p.name} is not available in the requested quantity.`);
+      return { id:p.id, name:cleanText(p.name, 160), price:safeNumber(p.price), quantity:requested, image:String(p.image || ''), selectedColor:cleanText(item.selectedColor, 80) || null, selectedFabric:cleanText(item.selectedFabric, 120) || null };
+    });
+    const subtotal = cleanItems.reduce((s,i)=>s+i.price*i.quantity,0); const shippingFee = subtotal >= 100000 ? 0 : 2500; const total = subtotal + shippingFee;
+    const fingerprint = orderFingerprint(email, cleanItems, total);
+    const existing = orders.find(o => o.idempotencyKey === idempotencyKey);
+    if (existing) {
+      if (existing.idempotencyFingerprint !== fingerprint) return res.status(409).json({ error:'This checkout request key is already associated with different order details.' });
+      if (existing.razorpayOrderId) return res.json({ orderId:existing.id, razorpayOrderId:existing.razorpayOrderId, amount:existing.amount || Number(existing.total) * 100, currency:existing.currency || storeCurrency, keyId:process.env.RAZORPAY_KEY_ID });
+      if (existing.status !== 'payment_error' && existing.paymentStatus !== 'failed' && isActiveReservation(existing)) return res.status(409).json({ error:'This payment order is still being prepared. Please retry shortly.' });
+      const staleIndex = orders.findIndex(o => o.id === existing.id); if (staleIndex >= 0) orders.splice(staleIndex, 1);
+    }
+    const receipt = `LEO-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const order = { id:receipt, idempotencyKey, idempotencyFingerprint:fingerprint, razorpayOrderId:null, email, shipping:{ name:cleanText(shipping.name,120), phone:cleanText(shipping.phone,30), pincode:cleanText(shipping.pincode,12), city:cleanText(shipping.city,80), state:cleanText(shipping.state,80), address1:cleanText(shipping.address1,240), address2:cleanText(shipping.address2,240) }, items:cleanItems, subtotal, shippingFee, total, amount:total * 100, currency:storeCurrency, status:'payment_pending', paymentStatus:'pending', reservationExpiresAt:new Date(Date.now() + paymentReservationMs).toISOString(), createdAt:now() };
+    orders.push(order); writeJson(ORDERS_FILE, orders);
+    try {
+      const rp = await razorpay.orders.create({ amount:order.amount, currency:storeCurrency, receipt, payment_capture:1, notes:{ store_order_id:receipt } });
+      const ready = updateOrder(order.id, { razorpayOrderId:rp.id });
+      res.json({ orderId:receipt, razorpayOrderId:rp.id, amount:order.amount, currency:order.currency, keyId:process.env.RAZORPAY_KEY_ID });
+      return ready;
+    } catch (providerError) {
+      updateOrder(order.id, { status:'payment_error', paymentStatus:'failed', reservationExpiresAt:now(), paymentError:cleanText(providerError.message || 'Payment provider error', 240) });
+      throw providerError;
+    }
+  } catch(e) { console.error('Order creation error', e); res.status(e.message?.includes('not available') || e.message?.includes('Invalid quantity') ? 409 : 500).json({ error:e.message || 'Unable to create order.' }); }
+});
+
+app.post('/api/orders/verify', rateLimit(20, 10 * 60 * 1000), async (req,res) => {
+  try {
+    if (!razorpayReady) return res.status(503).json({ error:'Payment service is not configured.' });
     const { orderId, razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body || {};
-    const order = findOrder(orderId);
-    if (!order || order.razorpayOrderId !== razorpayOrderId) return res.status(404).json({ error:'Order not found.' });
-    if (!verifyRazorpaySignature(razorpayOrderId, razorpayPaymentId, razorpaySignature)) return res.status(400).json({ error:'Payment signature verification failed.' });
+    const order = findOrder(cleanText(orderId, 80));
+    if (!order || order.razorpayOrderId !== cleanText(razorpayOrderId, 80)) return res.status(404).json({ error:'Order not found.' });
+    if (!/^pay_[A-Za-z0-9]+$/.test(String(razorpayPaymentId || '')) || !/^[A-Za-z0-9+/=_-]{32,200}$/.test(String(razorpaySignature || ''))) return res.status(400).json({ error:'Invalid payment confirmation.' });
+    if (!verifyRazorpaySignature(order.razorpayOrderId, razorpayPaymentId, razorpaySignature)) return res.status(400).json({ error:'Payment signature verification failed.' });
     const payment = await razorpay.payments.fetch(razorpayPaymentId);
-    if (payment.order_id !== razorpayOrderId || payment.amount !== order.total*100) return res.status(400).json({ error:'Payment/order validation failed.' });
-    if (payment.status === 'captured') return res.json({ ok:true, order: await markPaid(order, razorpayPaymentId) });
-    updateOrder(order.id, { paymentStatus:payment.status, razorpayPaymentId });
-    return res.status(409).json({ ok:false, error:`Payment is ${payment.status}.` });
-  } catch(e) { console.error(e); res.status(500).json({ error:'Unable to verify payment.' }); }
+    if (payment.id !== razorpayPaymentId || payment.order_id !== order.razorpayOrderId || Number(payment.amount) !== Number(order.amount || Number(order.total) * 100) || payment.currency !== (order.currency || storeCurrency)) return res.status(400).json({ error:'Payment/order validation failed.' });
+    if (payment.status === 'captured' && payment.captured !== false) return res.json({ ok:true, order:publicOrder(await markPaid(order, razorpayPaymentId)) });
+    updateOrder(order.id, { paymentStatus:cleanText(payment.status, 40), razorpayPaymentId });
+    return res.status(409).json({ ok:false, error:`Payment is ${cleanText(payment.status, 40) || 'not captured'}.` });
+  } catch(e) { console.error('Payment verification error', e); res.status(500).json({ error:'Unable to verify payment. Please contact support if your account was charged.' }); }
 });
 
 app.post('/api/customization-requests', async (req,res) => {
@@ -178,10 +249,13 @@ app.post('/api/customization-requests', async (req,res) => {
   } catch(e) { console.error(e); res.status(500).json({ error:'Unable to submit customisation request.' }); }
 });
 
-app.post('/api/admin/login', (req,res) => {
+app.post('/api/admin/login', rateLimit(10, 10 * 60 * 1000), (req,res) => {
   const { email, password } = req.body || {};
-  const validEmail = email === (process.env.ADMIN_EMAIL || 'admin@leonora.in');
-  const validPassword = password === (process.env.ADMIN_PASSWORD || 'LeonoraAdmin#2026');
+  const configuredEmail = normalizeEmail(process.env.ADMIN_EMAIL);
+  const configuredPassword = String(process.env.ADMIN_PASSWORD || '');
+  if (!configuredEmail || !configuredPassword) return res.status(503).json({ error:'Admin access is not configured.' });
+  const validEmail = normalizeEmail(email) === configuredEmail;
+  const validPassword = String(password || '') === configuredPassword;
   if (!validEmail || !validPassword) return res.status(401).json({ error:'Invalid admin credentials.' });
   const token = crypto.randomBytes(32).toString('hex');
   adminSessions.set(token, { email, createdAt:Date.now() });
@@ -219,6 +293,7 @@ app.put('/api/admin/products/:id', adminAuth, (req,res) => {
 app.post('/api/admin/orders/:id/status', adminAuth, (req,res) => { const allowed=['payment_pending','confirmed','processing','packed','shipped','out_for_delivery','delivered','cancelled']; const status=req.body?.status; if(!allowed.includes(status))return res.status(400).json({error:'Invalid order status'}); const o=updateOrder(req.params.id,{status}); if(!o)return res.status(404).json({error:'Order not found'}); res.json(o); });
 app.post('/api/admin/customizations/:id/status', adminAuth, (req,res) => { const allowed=['submitted','reviewing','quoted','approved','closed']; const status=req.body?.status; if(!allowed.includes(status))return res.status(400).json({error:'Invalid status'}); const arr=readJson(CUSTOM_FILE); const i=arr.findIndex(r=>r.id===req.params.id); if(i<0)return res.status(404).json({error:'Request not found'}); arr[i]={...arr[i],status,updatedAt:now()}; writeJson(CUSTOM_FILE,arr); res.json(arr[i]); });
 
+app.use('/api', (req,res) => res.status(404).json({ error:'API endpoint not found.' }));
 app.get('/health', (req,res) => res.status(200).json({status:'ok'}));
 app.get('*', (req,res) => res.sendFile(path.join(ROOT,'public','index.html')));
 app.listen(PORT, '0.0.0.0', () => console.log(`Leonora running on 0.0.0.0:${PORT} — Razorpay ${razorpayReady?'ready':'not configured'}`));
