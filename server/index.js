@@ -10,7 +10,8 @@ const Razorpay = require('razorpay');
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.join(__dirname, '..');
-const DATA = path.join(ROOT, 'data');
+const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, 'data');
+fs.mkdirSync(DATA, { recursive: true });
 const PRODUCTS_FILE = path.join(DATA, 'products.json');
 const CATEGORIES_FILE = path.join(DATA, 'categories.json');
 const ORDERS_FILE = path.join(DATA, 'orders.json');
@@ -18,7 +19,10 @@ const CUSTOM_FILE = path.join(DATA, 'customization-requests.json');
 const EVENTS_FILE = path.join(DATA, 'webhook-events.json');
 
 for (const f of [PRODUCTS_FILE, CATEGORIES_FILE, ORDERS_FILE, CUSTOM_FILE, EVENTS_FILE]) {
-  if (!fs.existsSync(f)) fs.writeFileSync(f, '[]');
+  if (fs.existsSync(f)) continue;
+  const seed = path.join(ROOT, 'data', path.basename(f));
+  if (process.env.DATA_DIR && fs.existsSync(seed)) fs.copyFileSync(seed, f);
+  else fs.writeFileSync(f, '[]');
 }
 
 const readJson = file => JSON.parse(fs.readFileSync(file, 'utf8'));

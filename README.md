@@ -4,7 +4,7 @@ Complete luxury furniture e-commerce store with customer storefront, Living / Be
 
 ## Deployment
 
-Use Node 18+ and run `npm install && npm start`. Configure the environment variables in `.env`. For Render, use a Node web service and set the start command to `npm start`.
+Use Node 18+ and run `npm install && npm start`. Configure the environment variables in `.env`. For Render, use a Node web service and set the start command to `npm start`. The `/admin` route is served before the storefront fallback so the standalone dashboard loads reliably. If using a persistent disk, set `DATA_DIR` to its mounted path (for example `/var/data`); without a mounted persistent disk or external database, JSON records are not durable across instance replacement.
 
 Set `PUBLIC_ORIGIN` to the exact public HTTPS origin of the storefront, without a trailing slash. Set explicit `ADMIN_EMAIL` and `ADMIN_PASSWORD` values; the server has no fallback administrator credentials.
 
@@ -24,4 +24,6 @@ Configure SMTP values to automatically send order confirmation and customisation
 
 ## Admin
 
-Open `/admin`. Production access requires the explicit `ADMIN_EMAIL` and `ADMIN_PASSWORD` environment variables. Change or rotate them before launch, and keep all Razorpay, SMTP, and storage secrets server-side.
+Open `/admin`. Production access requires the explicit `ADMIN_EMAIL` and `ADMIN_PASSWORD` environment variables. Change or rotate them before launch, and keep all Razorpay, SMTP, and storage secrets server-side. The dashboard provides Dashboard, Orders, Returns, Products, All Products, Categories, Inventory, Shipping, All Customers, Messages, Customisation Requests, Overview, Reports, and Finances. Inventory supports descriptions, regular pricing, optional sale pricing, customisation metadata, categories, and up to 15 Cloudinary images; the first image is the storefront primary image.
+
+Configure `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` for image uploads. The browser receives a cache-busted admin script so stale dashboard bundles are replaced after deployment. After changing Render environment variables, trigger a new deploy and sign in again if an old admin session remains in local storage.
