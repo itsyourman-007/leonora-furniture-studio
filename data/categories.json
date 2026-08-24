@@ -1,0 +1,6 @@
+[
+  {"id":"living","name":"Living","description":"Spaces made to gather.","createdAt":"2026-01-01T00:00:00.000Z"},
+  {"id":"bedroom","name":"Bedroom","description":"Quiet forms for slower rituals.","createdAt":"2026-01-01T00:00:00.000Z"},
+  {"id":"dining","name":"Dining","description":"Designed for long, memorable tables.","createdAt":"2026-01-01T00:00:00.000Z"},
+  {"id":"office","name":"Office","description":"Architectural pieces for focused work.","createdAt":"2026-01-01T00:00:00.000Z"}
+]

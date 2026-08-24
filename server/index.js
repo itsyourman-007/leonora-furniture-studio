@@ -12,11 +12,12 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.join(__dirname, '..');
 const DATA = path.join(ROOT, 'data');
 const PRODUCTS_FILE = path.join(DATA, 'products.json');
+const CATEGORIES_FILE = path.join(DATA, 'categories.json');
 const ORDERS_FILE = path.join(DATA, 'orders.json');
 const CUSTOM_FILE = path.join(DATA, 'customization-requests.json');
 const EVENTS_FILE = path.join(DATA, 'webhook-events.json');
 
-for (const f of [PRODUCTS_FILE, ORDERS_FILE, CUSTOM_FILE, EVENTS_FILE]) {
+for (const f of [PRODUCTS_FILE, CATEGORIES_FILE, ORDERS_FILE, CUSTOM_FILE, EVENTS_FILE]) {
   if (!fs.existsSync(f)) fs.writeFileSync(f, '[]');
 }
 
@@ -72,6 +73,26 @@ function adminAuth(req, res, next) {
 }
 function slugify(s) { return String(s).toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
 function safeNumber(n, min = 0) { const v = Number(n); return Number.isFinite(v) ? Math.max(min, v) : min; }
+function normalizeImages(images, fallback) { const list = Array.isArray(images) ? images : []; const all = [fallback, ...list].filter(v => typeof v === 'string' && /^https?:\/\//i.test(v.trim())).map(v => v.trim()); return [...new Set(all)].slice(0, 15); }
+function normalizeProductPayload(body, existing = {}) {
+  const originalPrice = safeNumber(body.originalPrice ?? body.price ?? existing.originalPrice ?? existing.price, 1);
+  const saleInput = Object.prototype.hasOwnProperty.call(body, 'discountedPrice') ? body.discountedPrice : existing.discountedPrice;
+  const rawSale = saleInput === '' || saleInput === null || saleInput === undefined ? null : safeNumber(saleInput);
+  const discountedPrice = rawSale !== null && rawSale > 0 && rawSale < originalPrice ? rawSale : null;
+  const images = normalizeImages(body.images ?? existing.images, body.image ?? existing.image);
+  return {
+    name:cleanText(body.name ?? existing.name, 160), description:cleanText(body.description ?? existing.description, 2000), category:cleanText(body.category ?? existing.category, 80), material:cleanText(body.material ?? existing.material ?? 'Made to order', 160),
+    originalPrice, discountedPrice, price:discountedPrice ?? originalPrice, images, image:images[0] || '', customizable:body.customizable === undefined ? Boolean(existing.customizable) : Boolean(body.customizable), colors:Array.isArray(body.colors) ? body.colors.map(v => cleanText(v,80)).filter(Boolean).slice(0,30) : (existing.colors || []), fabrics:Array.isArray(body.fabrics) ? body.fabrics.map(v => cleanText(v,120)).filter(Boolean).slice(0,30) : (existing.fabrics || []), dimensions:{ width:safeNumber(body.dimensions?.width ?? existing.dimensions?.width,1), depth:safeNumber(body.dimensions?.depth ?? existing.dimensions?.depth,1), height:safeNumber(body.dimensions?.height ?? existing.dimensions?.height,1) }, stock:safeNumber(body.stock ?? existing.stock)
+  };
+}
+function decorateProduct(product) {
+  const images = normalizeImages(product.images, product.image);
+  const originalPrice = safeNumber(product.originalPrice ?? product.price);
+  const discountedPrice = product.discountedPrice && Number(product.discountedPrice) < originalPrice ? safeNumber(product.discountedPrice) : null;
+  return { ...product, name:cleanText(product.name,160), description:cleanText(product.description,2000), originalPrice, discountedPrice, price:discountedPrice ?? originalPrice, images, image:images[0] || '' };
+}
+function readProducts() { return readJson(PRODUCTS_FILE).map(decorateProduct); }
+function readCategories() { return readJson(CATEGORIES_FILE); }
 function verifyRazorpaySignature(orderId, paymentId, signature) {
   if (!process.env.RAZORPAY_KEY_SECRET) return false;
   const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
@@ -169,7 +190,8 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(ROOT, 'public')));
 
 app.get('/api/config', (req,res) => res.json({ razorpayKeyId: razorpayReady ? process.env.RAZORPAY_KEY_ID : null, currency:storeCurrency, ready:razorpayReady }));
-app.get('/api/products', (req,res) => res.json(readJson(PRODUCTS_FILE)));
+app.get('/api/products', (req,res) => res.json(readProducts()));
+app.get('/api/categories', (req,res) => res.json(readCategories()));
 app.get('/api/orders/status', (req,res) => res.status(405).json({ error:'Use POST with order reference and checkout email.' }));
 app.get('/api/orders/:id', (req,res) => res.status(405).json({ error:'Order lookup requires POST with order reference and checkout email.' }));
 app.post('/api/orders/status', rateLimit(20, 10 * 60 * 1000), (req,res) => {
@@ -269,30 +291,42 @@ app.get('/api/admin/dashboard', adminAuth, (req,res) => {
   const year = new Date().getFullYear();
   const months = Array.from({length:12},(_,i)=>({ label:new Date(year,i,1).toLocaleString('en-IN',{month:'short'}), sales:0, orders:0 }));
   paid.forEach(o=>{ const d=new Date(o.paidAt||o.createdAt); if(d.getFullYear()===year){ months[d.getMonth()].sales+=Number(o.total||0); months[d.getMonth()].orders+=1; } });
-  const products = readJson(PRODUCTS_FILE); const customization = readJson(CUSTOM_FILE);
+  const products = readProducts(); const customization = readJson(CUSTOM_FILE);
   res.json({ metrics:{ totalOrders:paid.length, totalSales:sales, avgOrder:paid.length?sales/paid.length:0, lowStock:products.filter(p=>Number(p.stock||0)<=5).length, customizationRequests:customization.filter(r=>r.status==='submitted').length }, months, recentOrders:orders.slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,12), products, customizationRequests:customization.slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,30) });
 });
 
 app.get('/api/admin/orders', adminAuth, (req,res) => res.json(readJson(ORDERS_FILE).slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))));
-app.get('/api/admin/inventory', adminAuth, (req,res) => res.json(readJson(PRODUCTS_FILE)));
+app.get('/api/admin/inventory', adminAuth, (req,res) => res.json(readProducts()));
+app.get('/api/admin/categories', adminAuth, (req,res) => res.json(readCategories()));
 app.get('/api/admin/customizations', adminAuth, (req,res) => res.json(readJson(CUSTOM_FILE).slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))));
 
 app.post('/api/admin/products', adminAuth, (req,res) => {
   try {
-    const body = req.body || {};
-    if (!body.name || !body.category || !body.price || !body.image) return res.status(400).json({ error:'Name, category, price and image are required.' });
-    const products = readJson(PRODUCTS_FILE); let id = slugify(body.id || body.name); if(products.some(p=>p.id===id)) id += '-' + Date.now().toString(36);
-    const p = { id, name:String(body.name).trim(), category:String(body.category), material:String(body.material||'Made to order'), price:safeNumber(body.price), image:String(body.image), customizable:Boolean(body.customizable), colors:Array.isArray(body.colors)?body.colors:[], fabrics:Array.isArray(body.fabrics)?body.fabrics:[], dimensions:{width:safeNumber(body.dimensions?.width,1), depth:safeNumber(body.dimensions?.depth,1), height:safeNumber(body.dimensions?.height,1)}, stock:safeNumber(body.stock,0) };
-    products.push(p); writeJson(PRODUCTS_FILE, products); res.status(201).json(p);
-  } catch(e){ res.status(500).json({error:'Unable to add product.'}); }
+    const body = req.body || {}; const payload = normalizeProductPayload(body);
+    if (!payload.name || !payload.category || !payload.originalPrice || !payload.images.length) return res.status(400).json({ error:'Product name, category, regular price and at least one image are required.' });
+    if (body.discountedPrice !== undefined && body.discountedPrice !== null && body.discountedPrice !== '' && Number(body.discountedPrice) >= payload.originalPrice) return res.status(400).json({ error:'Discounted price must be lower than regular price.' });
+    const products = readJson(PRODUCTS_FILE); let id = slugify(body.id || payload.name); if(products.some(p=>p.id===id)) id += '-' + Date.now().toString(36);
+    const p = { id, ...payload, createdAt:now(), updatedAt:now() };
+    products.push(p); writeJson(PRODUCTS_FILE, products); res.status(201).json(decorateProduct(p));
+  } catch(e){ console.error('Product create error', e); res.status(500).json({error:'Unable to add product.'}); }
 });
 app.put('/api/admin/products/:id', adminAuth, (req,res) => {
-  const products=readJson(PRODUCTS_FILE); const i=products.findIndex(p=>p.id===req.params.id); if(i<0)return res.status(404).json({error:'Product not found'});
-  const b=req.body||{}; products[i]={...products[i],...b,price:b.price===undefined?products[i].price:safeNumber(b.price),stock:b.stock===undefined?products[i].stock:safeNumber(b.stock),customizable:b.customizable===undefined?products[i].customizable:Boolean(b.customizable)}; writeJson(PRODUCTS_FILE,products); res.json(products[i]);
+  try {
+    const products=readJson(PRODUCTS_FILE); const i=products.findIndex(p=>p.id===req.params.id); if(i<0)return res.status(404).json({error:'Product not found'});
+    const payload=normalizeProductPayload(req.body||{}, products[i]); if(!payload.name||!payload.category||!payload.originalPrice||!payload.images.length)return res.status(400).json({error:'Product name, category, regular price and at least one image are required.'});
+    if (req.body?.discountedPrice !== undefined && req.body.discountedPrice !== null && req.body.discountedPrice !== '' && Number(req.body.discountedPrice) >= payload.originalPrice) return res.status(400).json({ error:'Discounted price must be lower than regular price.' });
+    products[i]={...products[i],...payload,updatedAt:now()}; writeJson(PRODUCTS_FILE,products); res.json(decorateProduct(products[i]));
+  } catch(e){ console.error('Product update error', e); res.status(500).json({error:'Unable to update product.'}); }
+});
+app.post('/api/admin/categories', adminAuth, (req,res) => {
+  const name=cleanText(req.body?.name,80), description=cleanText(req.body?.description,240); if(!name)return res.status(400).json({error:'Category name is required.'});
+  const categories=readCategories(); if(categories.some(c=>c.name.toLowerCase()===name.toLowerCase()))return res.status(409).json({error:'Category already exists.'});
+  const category={id:slugify(name),name,description,createdAt:now()}; categories.push(category); writeJson(CATEGORIES_FILE,categories); res.status(201).json(category);
 });
 app.post('/api/admin/orders/:id/status', adminAuth, (req,res) => { const allowed=['payment_pending','confirmed','processing','packed','shipped','out_for_delivery','delivered','cancelled']; const status=req.body?.status; if(!allowed.includes(status))return res.status(400).json({error:'Invalid order status'}); const o=updateOrder(req.params.id,{status}); if(!o)return res.status(404).json({error:'Order not found'}); res.json(o); });
 app.post('/api/admin/customizations/:id/status', adminAuth, (req,res) => { const allowed=['submitted','reviewing','quoted','approved','closed']; const status=req.body?.status; if(!allowed.includes(status))return res.status(400).json({error:'Invalid status'}); const arr=readJson(CUSTOM_FILE); const i=arr.findIndex(r=>r.id===req.params.id); if(i<0)return res.status(404).json({error:'Request not found'}); arr[i]={...arr[i],status,updatedAt:now()}; writeJson(CUSTOM_FILE,arr); res.json(arr[i]); });
 
+app.get(['/admin', '/admin/*'], (req,res) => res.sendFile(path.join(ROOT, 'public', 'admin.html')));
 app.use('/api', (req,res) => res.status(404).json({ error:'API endpoint not found.' }));
 app.get('/health', (req,res) => res.status(200).json({status:'ok'}));
 app.get('*', (req,res) => res.sendFile(path.join(ROOT,'public','index.html')));
