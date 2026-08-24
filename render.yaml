@@ -1,8 +1,9 @@
 services:
   - type: web
     name: leonora-furniture-studio
-    env: node
+    runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
     autoDeploy: true
+    healthCheckPath: /health
