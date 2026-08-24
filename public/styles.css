@@ -10,3 +10,8 @@
 .intro-fallback>div{font:500 12px Manrope,Arial,sans-serif;letter-spacing:.28em}
 .intro-fallback h1{font:400 clamp(36px,7vw,72px) 'EB Garamond',Georgia,serif;margin:18px 0 0}
 @media(max-width:600px){.intro-skip{right:16px;bottom:16px}.intro-fallback{padding:42px 18px}.intro-fallback>div{letter-spacing:.16em}}
+
+.intro-sound{position:absolute;left:24px;bottom:24px;border:1px solid rgba(255,255,255,.7);border-radius:999px;background:rgba(17,17,17,.58);color:#fff;padding:11px 18px;display:inline-flex;align-items:center;gap:7px;font:500 11px Manrope,Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(8px)}
+.intro-sound:hover,.intro-sound.enabled{background:rgba(255,255,255,.92);color:#111}
+.intro-sound .material-symbols-outlined{font-size:17px}
+@media(max-width:600px){.intro-sound{left:16px;bottom:16px;padding:11px 14px}.intro-skip{right:16px;bottom:16px}}
