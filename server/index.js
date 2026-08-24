@@ -331,6 +331,13 @@ app.post('/api/admin/orders/:id/status', adminAuth, (req,res) => { const allowed
 app.post('/api/admin/customizations/:id/status', adminAuth, (req,res) => { const allowed=['submitted','reviewing','quoted','approved','closed']; const status=req.body?.status; if(!allowed.includes(status))return res.status(400).json({error:'Invalid status'}); const arr=readJson(CUSTOM_FILE); const i=arr.findIndex(r=>r.id===req.params.id); if(i<0)return res.status(404).json({error:'Request not found'}); arr[i]={...arr[i],status,updatedAt:now()}; writeJson(CUSTOM_FILE,arr); res.json(arr[i]); });
 
 app.get(['/admin', '/admin/*'], (req,res) => res.sendFile(path.join(ROOT, 'public', 'admin.html')));
+app.post('/api/admin/cloudinary-signature', adminAuth, (req,res) => {
+  if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) return res.status(503).json({ error:'Cloudinary is not configured on Render.' });
+  const timestamp = Math.floor(Date.now() / 1000); const folder = 'leonora/products';
+  const signature = crypto.createHash('sha1').update(`folder=${folder}&timestamp=${timestamp}` + process.env.CLOUDINARY_API_SECRET).digest('hex');
+  res.json({ cloudName:process.env.CLOUDINARY_CLOUD_NAME, apiKey:process.env.CLOUDINARY_API_KEY, timestamp, folder, signature, uploadUrl:`https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload` });
+});
+app.__leonoraCloudinaryRoutes = true;
 app.use('/api', (req,res) => res.status(404).json({ error:'API endpoint not found.' }));
 app.get('/health', (req,res) => res.status(200).json({status:'ok'}));
 app.get('*', (req,res) => res.sendFile(path.join(ROOT,'public','index.html')));
