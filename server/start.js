@@ -1,22 +1,10 @@
-// Render/production bootstrap: preserve the raw webhook body while keeping JSON parsing for the rest of the API.
+require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
 const originalJson = express.json;
 const originalRaw = express.raw;
-express.json = (options = {}) => originalJson({
-  ...options,
-  verify(req, res, buf) {
-    req.rawBody = Buffer.from(buf);
-    if (typeof options.verify === 'function') options.verify(req, res, buf);
-  }
-});
-express.raw = (options = {}) => {
-  const middleware = originalRaw(options);
-  return (req, res, next) => {
-    if (req.rawBody) {
-      req.body = req.rawBody;
-      return next();
-    }
-    return middleware(req, res, next);
-  };
-};
+const originalListen = express.application.listen;
+express.json = (options = {}) => originalJson({...options,verify(req,res,buf){req.rawBody=Buffer.from(buf);if(typeof options.verify==='function')options.verify(req,res,buf)}});
+express.raw = (options = {}) => {const middleware=originalRaw(options);return (req,res,next)=>{if(req.rawBody){req.body=req.rawBody;return next()}return middleware(req,res,next)}};
+express.application.listen = function(...args){const app=this;if(!app.__leonoraMediaRoutes){app.post('/api/admin/cloudinary-signature',async(req,res)=>{try{const auth=String(req.headers.authorization||'');if(!auth.startsWith('Bearer '))return res.status(401).json({error:'Admin authentication required.'});if(!process.env.CLOUDINARY_CLOUD_NAME||!process.env.CLOUDINARY_API_KEY||!process.env.CLOUDINARY_API_SECRET)return res.status(503).json({error:'Cloudinary is not configured on Render.'});const check=await fetch(`http://127.0.0.1:${process.env.PORT||3000}/api/admin/orders`,{headers:{Authorization:auth}});if(!check.ok)return res.status(401).json({error:'Admin session expired.'});const timestamp=Math.floor(Date.now()/1000);const folder='leonora/products';const signature=crypto.createHash('sha1').update(`folder=${folder}&timestamp=${timestamp}`+process.env.CLOUDINARY_API_SECRET).digest('hex');res.json({cloudName:process.env.CLOUDINARY_CLOUD_NAME,apiKey:process.env.CLOUDINARY_API_KEY,timestamp,folder,signature,uploadUrl:`https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`})}catch(e){console.error(e);res.status(500).json({error:'Unable to prepare image upload.'})}});app.__leonoraMediaRoutes=true}return originalListen.apply(this,args)};
 require('./index');
