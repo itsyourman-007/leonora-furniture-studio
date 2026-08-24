@@ -1,11 +1,16 @@
 const express = require('express');
 const crypto = require('crypto');
+const path = require('path');
 const originalListen = express.application.listen;
 
 if (!express.application.__leonoraCloudinaryPatched) {
   express.application.listen = function (...args) {
     const app = this;
     if (!app.__leonoraCloudinaryRoutes) {
+      app.get(['/admin', '/admin/*'], (req, res) => {
+        res.sendFile(path.join(process.cwd(), 'public', 'admin.html'));
+      });
+
       app.post('/api/admin/cloudinary-signature', async (req, res) => {
         try {
           const auth = String(req.headers.authorization || '');
