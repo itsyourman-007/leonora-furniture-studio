@@ -10,11 +10,3 @@
 .intro-fallback>div{font:500 12px Manrope,Arial,sans-serif;letter-spacing:.28em}
 .intro-fallback h1{font:400 clamp(36px,7vw,72px) 'EB Garamond',Georgia,serif;margin:18px 0 0}
 @media(max-width:600px){.intro-skip{right:16px;bottom:16px}.intro-fallback{padding:42px 18px}.intro-fallback>div{letter-spacing:.16em}}
-
-
-
-.intro-actions{position:absolute;left:24px;right:24px;bottom:24px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.intro-mute{border:1px solid rgba(255,255,255,.7);border-radius:999px;background:rgba(17,17,17,.58);color:#fff;padding:11px 18px;font:500 11px Manrope,Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;backdrop-filter:blur(8px)}
-.intro-mute:hover{background:rgba(255,255,255,.92);color:#111}
-.intro-actions .intro-skip{position:static}
-@media(max-width:600px){.intro-actions{left:16px;right:16px;bottom:16px}.intro-mute,.intro-actions .intro-skip{padding:11px 14px}}
